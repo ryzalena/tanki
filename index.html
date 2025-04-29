@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Динамическая Игра WebSocket</title>
+    <style>
+        body { margin: 0; background-color: #222; display: flex; justify-content: center; align-items: center; height: 100vh; color: white; font-family: sans-serif; }
+        canvas { border: 1px solid #555; background-color: #333; }
+        #info { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.5); padding: 5px; border-radius: 3px; }
+        #score { position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.5); padding: 5px; border-radius: 3px; }
+        #controls { position: absolute; bottom: 10px; left: 10px; background: rgba(0,0,0,0.5); padding: 5px; border-radius: 3px; }
+        #lives { position: absolute; top: 50px; right: 10px; background: rgba(0,0,0,0.5); padding: 5px; border-radius: 3px; }
+        #nicknameModal { 
+            position: fixed; 
+            top: 0; 
+            left: 0; 
+            width: 100%; 
+            height: 100%; 
+            background: rgba(0,0,0,0.8); 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            z-index: 1000; 
+        }
+        #nicknameForm { 
+            background: #333; 
+            padding: 20px; 
+            border-radius: 5px; 
+            text-align: center; 
+        }
+        #nicknameInput { 
+            padding: 10px; 
+            margin: 10px 0; 
+            width: 200px; 
+            font-size: 16px; 
+        }
+        #nicknameSubmit { 
+            padding: 10px 20px; 
+            background: #555; 
+            color: white; 
+            border: none; 
+            border-radius: 3px; 
+            cursor: pointer; 
+        }
+    </style>
+</head>
+<body>
+    <div id="nicknameModal">
+        <div id="nicknameForm">
+            <h2>Введите ваш никнейм</h2>
+            <input type="text" id="nicknameInput" maxlength="15" placeholder="Мой никнейм">
+            <button id="nicknameSubmit">Играть</button>
+        </div>
+    </div>
+
+    <canvas id="gameCanvas"></canvas>
+    <div id="info">Status: Connecting...</div>
+    <div id="score">Score: 0</div>
+    <div id="lives">Lives: 15</div>
+    <div id="controls">
+        Движение: WASD или Стрелки<br>
+        Стрельба: I (вверх), K (вниз), J (влево), L (вправо)
+    </div>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const infoElement = document.getElementById('info');
+        const scoreElement = document.getElementById('score');
+        const nicknameModal = document.getElementById('nicknameModal');
+        const nicknameInput = document.getElementById('nicknameInput');
+        const nicknameSubmit = document.getElementById('nicknameSubmit');
+
+        // Размеры из Go констант (можно передавать с сервера)
+        const GAME_WIDTH = 800;
+        const GAME_HEIGHT = 600;
+        canvas.width = GAME_WIDTH;
+        canvas.height = GAME_HEIGHT;
+
+        // Загрузка изображений
+        const tankBodyImg = new Image();
+        tankBodyImg.src = '/static/korpus.png';
+        const tankGunImg = new Image();
+        tankGunImg.src = '/static/pushka.png';
+        const tree = new Image();
+        tree.src='/static/tree.png';
+
+        let ws = null;
+        let myPlayerId = null;
+        let myNickname = '';
+        let players = {};
+        let projectiles = {};
+        let gameLoopId = null;
+        let lastInputSendTime = 0;
+        const inputSendInterval = 50;
+
+        // Состояние нажатых клавиш
+        const keysPressed = {
+            up: false,
+            down: false,
+            left: false,
+            right: false
+        };
+
+        // Текущее направление прицела игрока
+        let aimDirection = {
+            x: 0,
+            y: 0
+        };
+
+        // Обработчик отправки никнейма
+        nicknameSubmit.addEventListener('click', () => {
+            myNickname = nicknameInput.value.trim();
+            if (myNickname.length > 0) {
+                nicknameModal.style.display = 'none';
+                connectWebSocket();
+            } else {
+                alert('Пожалуйста, введите никнейм');
+            }
+        });
+
+        // Также разрешаем отправку по Enter
+        nicknameInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                nicknameSubmit.click();
+            }
+        });
+
+        function connectWebSocket() {
+            infoElement.textContent = "Status: Connecting...";
+            if (ws && ws.readyState !== WebSocket.CLOSED) {
+                ws.close();
+            }
+
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                infoElement.textContent = "Status: Connected";
+                console.log("WebSocket Connected");
+                // Отправляем никнейм серверу сразу после подключения
+                ws.send(JSON.stringify({ 
+                    action: "setNickname", 
+                    payload: { nickname: myNickname } 
+                }));
+                
+                if (!gameLoopId) {
+                    gameLoopId = requestAnimationFrame(clientGameLoop);
+                }
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const serverMsg = JSON.parse(event.data);
+                    handleServerMessage(serverMsg);
+                } catch (e) {
+                    console.error("Failed to parse server message:", e);
+                }
+            };
+
+            ws.onclose = (event) => {
+                infoElement.textContent = `Status: Disconnected (Code: ${event.code})`;
+                console.log("WebSocket Disconnected");
+                ws = null;
+                myPlayerId = null;
+                players = {};
+                projectiles = {};
+                if (gameLoopId) {
+                    cancelAnimationFrame(gameLoopId);
+                    gameLoopId = null;
+                }
+                setTimeout(connectWebSocket, 2000);
+            };
+
+            ws.onerror = (error) => {
+                infoElement.textContent = "Status: Connection Error";
+                console.error("WebSocket Error:", error);
+            };
+        }
+
+        function handleServerMessage(msg) {
+            switch (msg.type) {
+                case "assignId":
+                    myPlayerId = msg.payload.id;
+                    console.log("Assigned Player ID:", myPlayerId);
+                    break;
+                case "gameState":
+                    const newPlayers = {};
+                    msg.payload.players.forEach(p => newPlayers[p.id] = p);
+                    players = newPlayers;
+
+                    const newProjectiles = {};
+                    msg.payload.projectiles.forEach(p => newProjectiles[p.id] = p);
+                    projectiles = newProjectiles;
+
+                    if (myPlayerId && players[myPlayerId]) {
+                        scoreElement.textContent = `Score: ${players[myPlayerId].score}`;
+                        document.getElementById('lives').textContent = `Lives: ${players[myPlayerId].lives}`;
+                    } else {
+                        scoreElement.textContent = `Score: -`;
+                        document.getElementById('lives').textContent = `Lives: -`;
+                    }
+                    break;
+                case "error":
+                    console.error("Server Error:", msg.payload);
+                    infoElement.textContent = `Error: ${msg.payload}`;
+                    break;
+                default:
+                    console.warn("Unknown message type:", msg.type);
+            }
+        }
+
+        function sendInput() {
+        if (!ws || ws.readyState !== WebSocket.OPEN || !myPlayerId) {
+            console.log("WebSocket не готов или ID игрока не назначен");
+            return;
+        }
+        const now = Date.now();
+        if (now - lastInputSendTime >= inputSendInterval) {
+            if (players[myPlayerId]) {
+                const payload = {
+                    up: keysPressed.up,
+                    down: keysPressed.down,
+                    left: keysPressed.left,
+                    right: keysPressed.right,
+                    aimX: players[myPlayerId].x + aimDirection.x,
+                    aimY: players[myPlayerId].y + aimDirection.y
+                };
+                ws.send(JSON.stringify({ action: "input", payload: payload }));
+                lastInputSendTime = now;
+            }
+        }
+    }
+
+        function sendShoot() {
+             if (!ws || ws.readyState !== WebSocket.OPEN || !myPlayerId || !players[myPlayerId]) {
+                return;
+            }
+            const player = players[myPlayerId];
+            const shootPayload = {
+                aimX: player.x + aimDirection.x,
+                aimY: player.y + aimDirection.y
+            };
+            ws.send(JSON.stringify({ 
+                action: "shoot", 
+                payload: shootPayload 
+            }));
+        }
+
+        // --- Обработка ввода ---
+        window.addEventListener('keydown', (e) => {
+            let inputChanged = false;
+            switch(e.key.toLowerCase()) {
+                case 'w': case 'arrowup':    
+                    if (!keysPressed.up)    { keysPressed.up = true; inputChanged = true; } 
+                    break;
+                case 's': case 'arrowdown':  
+                    if (!keysPressed.down)  { keysPressed.down = true; inputChanged = true; } 
+                    break;
+                case 'a': case 'arrowleft':  
+                    if (!keysPressed.left)  { keysPressed.left = true; inputChanged = true; } 
+                    break;
+                case 'd': case 'arrowright': 
+                    if (!keysPressed.right) { keysPressed.right = true; inputChanged = true; } 
+                    break;
+                    
+                case 'i':  // Вверх
+                    aimDirection = { x: 0, y: -100 };
+                    sendShoot();
+                    break;
+                case 'k':  // Вниз
+                    aimDirection = { x: 0, y: 100 };
+                    sendShoot();
+                    break;
+                case 'j':  // Влево
+                    aimDirection = { x: -100, y: 0 };
+                    sendShoot();
+                    break;
+                case 'l':  // Вправо
+                    aimDirection = { x: 100, y: 0 };
+                    sendShoot();
+                    break;
+            }
+            if (inputChanged) { sendInput(); }
+        });
+
+        window.addEventListener('keyup', (e) => {
+             let inputChanged = false;
+             switch(e.key.toLowerCase()) {
+                case 'w': case 'arrowup':    
+                    if (keysPressed.up)    { keysPressed.up = false; inputChanged = true; } 
+                    break;
+                case 's': case 'arrowdown':  
+                    if (keysPressed.down)  { keysPressed.down = false; inputChanged = true; } 
+                    break;
+                case 'a': case 'arrowleft':  
+                    if (keysPressed.left)  { keysPressed.left = false; inputChanged = true; } 
+                    break;
+                case 'd': case 'arrowright': 
+                    if (keysPressed.right) { keysPressed.right = false; inputChanged = true; } 
+                    break;
+            }
+             if (inputChanged) { sendInput(); }
+        });
+
+        function drawRotatedImage(image, x, y, angle, width, height) {
+            ctx.save();
+            ctx.translate(x, y);
+            ctx.rotate(angle);
+            ctx.drawImage(image, -width/2, -height/2, width, height);
+            ctx.restore();
+        }
+
+        function clientGameLoop(timestamp) {
+            ctx.clearRect(0, 0, GAME_WIDTH, GAME_HEIGHT);
+
+            sendInput();
+
+            // Рисуем игроков
+            for (const id in players) {
+                const p = players[id];
+                
+                const bodyWidth = 30;
+                const bodyHeight = 60;
+                const gunWidth = 50;
+                const gunHeight = 30;
+                
+                // Рисуем корпус танка
+                if (tankBodyImg.complete) {
+                    drawRotatedImage(tankBodyImg, p.x, p.y, p.bodyAngle, bodyWidth, bodyHeight);
+                } else {
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, 15, 0, Math.PI * 2);
+                    ctx.fillStyle = p.color;
+                    ctx.fill();
+                }
+                
+                // Рисуем пушку танка
+                if (tankGunImg.complete) {
+                    drawRotatedImage(tankGunImg, p.x, p.y, p.aimAngle, gunWidth, gunHeight);
+                }
+                
+                // Обводка для текущего игрока
+                if (id === myPlayerId) {
+                    ctx.save();
+                    ctx.translate(p.x, p.y);
+                    ctx.rotate(p.bodyAngle);
+                    ctx.strokeStyle = 'white';
+                    ctx.lineWidth = 1;
+                    ctx.strokeRect(-bodyWidth/2, -bodyHeight/2, bodyWidth, bodyHeight);
+                    ctx.restore();
+                }
+
+                // Рисуем никнейм игрока
+                if (p.nickname) {
+                    ctx.font = '12px Arial';
+                    ctx.fillStyle = 'white';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(p.nickname, p.x, p.y - 25);
+                }
+            }
+
+            // Рисуем снаряды
+            ctx.fillStyle = 'yellow';
+            for (const id in projectiles) {
+                const p = projectiles[id];
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            gameLoopId = requestAnimationFrame(clientGameLoop);
+        }
+    </script>
+</body>
+</html>
